@@ -1,6 +1,71 @@
 # Changelog
 
 --------------------------------------------
+[0.9.44] - 2023-09-25
+
+* [Windows] fix: fix Renderer bug for Windows.
+* [Native] fix: Use independent threads to process frame encryption/decryption
+* [Native] fix: Correct handle SIF frame
+* [Native] fix: Fix a fault tolerance judgment failure
+
+[0.9.43] - 2023-09-20
+
+* [Native] fix: send frame cryptor events from signaling thread.
+* [Native] fix: h264 freeze when using E2EE.
+
+[0.9.42+hotfix.1] - 2023-09-15
+
+* [Windows/Linux] fix: fix cannot start vp8/h264 encoder correctly.
+
+[0.9.42] - 2023-09-15
+
+* [Dart/Native] feat: add more framcryptor api (#1444)
+* [Dart/Native] feat: support scalability mode (#1442)
+* [Android] fix: Turn off audio routing in non communication modes (#1438)
+
+* [Android] feat: Add more control over android audio options.
+
+[0.9.41] - 2023-08-30
+
+* [Android] feat: Add more control over android audio options.
+
+[0.9.40] - 2023-08-16
+
+* [Windows/Linux] fix: nullptr checking for sender/receiver for getStats.
+
+[0.9.39] - 2023-08-14
+
+* [Dart/Native] feat: add async methods for getting pc states.
+
+[0.9.38] - 2023-08-11
+
+* [Android] fix: Expose helper to clearCommunicationDevice on AudioManager.AUDIOFOCUS_LOSS
+* [Android] feat: support force SW codec list for android, and disable HW codec for VP9 by default.
+* [Android] fix: issue for audio device switch (#1417)
+* [Android/iOS] feat: Added setZoom method to support camera zooming while streaming. (#1412).
+
+[0.9.37] - 2023-08-07
+
+* [Native] fix: Skip set_sdp_fmtp_line if sdpFmtpLine is empty.
+* [Android] fix: fix android earpiece not being replaced after wired headset is disconnected.
+* [Dart] fix: partially rebuild RTCVideoView when renderVideo value changes.
+* [Android] feat: expose android audio modes.
+* [Android] feat: support forceSWCodec for Android.
+* [Linux] fix: add $ORIGIN to rpath.
+
+[0.9.36] - 2023-07-13
+
+* [Native] upgrade libwebrtc to m114.5735.02.
+* [Windows/Linux] Add implementation to MediaStreamTrack.captureFrame() for linux/windows.
+* [Darwin/Android] Support to ignore network adapters used for ICE on Android, iOS and macOS.
+
+[0.9.35] - 2023-06-30
+
+* [iOS] feat: expose audio mode for ios.
+* [Darwin] fix: compiler warning for Darwin.
+* [Dart] Fix setMicrophoneMute() not awaitable.
+* [Native] Update libwebrtc to m114.
+* [Dart/Web] Separate frame cryptor to dart-webrtc.
 
 [0.9.34] - 2023-06-14
 

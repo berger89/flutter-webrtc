@@ -8,8 +8,8 @@ import android.content.pm.PackageManager;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
 import android.hardware.Camera.CameraInfo;
+import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
-import android.media.AudioManager;
 import android.os.Build;
 import android.util.Log;
 import android.util.LongSparseArray;
@@ -20,6 +20,7 @@ import androidx.annotation.RequiresApi;
 
 import com.cloudwebrtc.webrtc.audio.AudioDeviceKind;
 import com.cloudwebrtc.webrtc.audio.AudioSwitchManager;
+import com.cloudwebrtc.webrtc.audio.AudioUtils;
 import com.cloudwebrtc.webrtc.record.AudioChannel;
 import com.cloudwebrtc.webrtc.record.FrameCapturer;
 import com.cloudwebrtc.webrtc.utils.AnyThreadResult;
@@ -29,7 +30,7 @@ import com.cloudwebrtc.webrtc.utils.ConstraintsMap;
 import com.cloudwebrtc.webrtc.utils.EglUtils;
 import com.cloudwebrtc.webrtc.utils.ObjectType;
 import com.cloudwebrtc.webrtc.utils.PermissionUtils;
-
+import com.cloudwebrtc.webrtc.utils.Utils;
 import com.twilio.audioswitch.AudioDevice;
 
 import org.webrtc.AudioTrack;
@@ -63,12 +64,12 @@ import org.webrtc.SdpObserver;
 import org.webrtc.SessionDescription;
 import org.webrtc.SessionDescription.Type;
 import org.webrtc.VideoTrack;
-import org.webrtc.WrappedVideoDecoderFactory;
 import org.webrtc.audio.AudioDeviceModule;
 import org.webrtc.audio.JavaAudioDeviceModule;
+import org.webrtc.video.CustomVideoDecoderFactory;
+import org.webrtc.video.CustomVideoEncoderFactory;
 
 import java.io.File;
-import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -110,6 +111,10 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   private Activity activity;
 
+  private CustomVideoEncoderFactory videoEncoderFactory;
+
+  private CustomVideoDecoderFactory videoDecoderFactory;
+
   MethodCallHandlerImpl(Context context, BinaryMessenger messenger, TextureRegistry textureRegistry) {
     this.context = context;
     this.textures = textureRegistry;
@@ -137,8 +142,8 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
     mPeerConnectionObservers.clear();
   }
-
-  private void ensureInitialized() {
+  private void initialize(int networkIgnoreMask, boolean forceSWCodec, List<String> forceSWCodecList,
+  @Nullable ConstraintsMap androidAudioConfiguration) {
     if (mFactory != null) {
       return;
     }
@@ -148,35 +153,136 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
                     .setEnableInternalTracer(true)
                     .createInitializationOptions());
 
-    // Initialize EGL contexts required for HW acceleration.
-    EglBase.Context eglContext = EglUtils.getRootEglBaseContext();
-
     getUserMediaImpl = new GetUserMediaImpl(this, context);
 
     frameCryptor = new FlutterRTCFrameCryptor(this);
 
-    audioDeviceModule = JavaAudioDeviceModule.builder(context)
+    AudioAttributes audioAttributes = null;
+    if (androidAudioConfiguration != null) {
+      Integer usageType = AudioUtils.getAudioAttributesUsageTypeForString(
+              androidAudioConfiguration.getString("androidAudioAttributesUsageType"));
+      Integer contentType = AudioUtils.getAudioAttributesContentTypeFromString(
+              androidAudioConfiguration.getString("androidAudioAttributesContentType"));
+
+      // Warn if one is provided without the other.
+      if (usageType == null ^ contentType == null) {
+          Log.w(TAG, "usageType and contentType must both be provided!");
+      }
+
+      if (usageType != null && contentType != null) {
+          audioAttributes = new AudioAttributes.Builder()
+                  .setUsage(usageType)
+                  .setContentType(contentType)
+                  .build();
+      }
+    }
+
+    JavaAudioDeviceModule.Builder audioDeviceModuleBuilder = JavaAudioDeviceModule.builder(context)
             .setUseHardwareAcousticEchoCanceler(true)
             .setUseHardwareNoiseSuppressor(true)
-            .setSamplesReadyCallback(getUserMediaImpl.inputSamplesInterceptor)
-            .createAudioDeviceModule();
+            .setSamplesReadyCallback(getUserMediaImpl.inputSamplesInterceptor);
+
+    if (audioAttributes != null) {
+      audioDeviceModuleBuilder.setAudioAttributes(audioAttributes);
+    }
+
+    audioDeviceModule = audioDeviceModuleBuilder.createAudioDeviceModule();
 
     getUserMediaImpl.audioDeviceModule = (JavaAudioDeviceModule) audioDeviceModule;
 
-    mFactory = PeerConnectionFactory.builder()
-            .setOptions(new Options())
-            .setVideoEncoderFactory(new SimulcastVideoEncoderFactoryWrapper(eglContext, true, true))
-            .setVideoDecoderFactory(new WrappedVideoDecoderFactory(eglContext))
+    final Options options = new Options();
+    options.networkIgnoreMask = networkIgnoreMask;
+
+    final PeerConnectionFactory.Builder factoryBuilder = PeerConnectionFactory.builder()
+            .setOptions(options);
+
+    // Initialize EGL contexts required for HW acceleration.
+    EglBase.Context eglContext = EglUtils.getRootEglBaseContext();
+
+    videoEncoderFactory = new CustomVideoEncoderFactory(eglContext, true, true);
+    videoDecoderFactory = new CustomVideoDecoderFactory(eglContext);
+
+    factoryBuilder
+            .setVideoEncoderFactory(videoEncoderFactory)
+            .setVideoDecoderFactory(videoDecoderFactory);
+
+    videoDecoderFactory.setForceSWCodec(forceSWCodec);
+    videoDecoderFactory.setForceSWCodecList(forceSWCodecList);
+    videoEncoderFactory.setForceSWCodec(forceSWCodec);
+    videoEncoderFactory.setForceSWCodecList(forceSWCodecList);
+
+    mFactory = factoryBuilder
             .setAudioDeviceModule(audioDeviceModule)
             .createPeerConnectionFactory();
+
   }
 
   @Override
   public void onMethodCall(MethodCall call, @NonNull Result notSafeResult) {
-    ensureInitialized();
 
     final AnyThreadResult result = new AnyThreadResult(notSafeResult);
     switch (call.method) {
+      case "initialize": {
+        int networkIgnoreMask = Options.ADAPTER_TYPE_UNKNOWN;
+        Map<String, Object> options = call.argument("options");
+        ConstraintsMap constraintsMap = new ConstraintsMap(options);
+        if (constraintsMap.hasKey("networkIgnoreMask")
+                && constraintsMap.getType("networkIgnoreMask") == ObjectType.Array) {
+          final ConstraintsArray ignoredAdapters = constraintsMap.getArray("networkIgnoreMask");
+          if (ignoredAdapters != null) {
+            for (Object adapter : ignoredAdapters.toArrayList()) {
+              switch (adapter.toString()) {
+                case "adapterTypeEthernet":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_ETHERNET;
+                  break;
+                case "adapterTypeWifi":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_WIFI;
+                  break;
+                case "adapterTypeCellular":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_CELLULAR;
+                  break;
+                case "adapterTypeVpn":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_VPN;
+                  break;
+                case "adapterTypeLoopback":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_LOOPBACK;
+                  break;
+                case "adapterTypeAny":
+                  networkIgnoreMask += Options.ADAPTER_TYPE_ANY;
+                  break;
+              }
+            }
+
+          }
+        }
+        boolean forceSWCodec = false;
+        if (constraintsMap.hasKey("forceSWCodec")
+                && constraintsMap.getType("forceSWCodec") == ObjectType.Boolean) {
+          final boolean v = constraintsMap.getBoolean("forceSWCodec");
+          forceSWCodec = v;
+        }
+        List<String> forceSWCodecList = new ArrayList<>();
+        if(constraintsMap.hasKey("forceSWCodecList")
+                && constraintsMap.getType("forceSWCodecList") == ObjectType.Array) {
+          final List<Object> array = constraintsMap.getListArray("forceSWCodecList");
+          for(Object v : array) {
+            forceSWCodecList.add(v.toString());
+          }
+        } else {
+          // disable HW Codec for VP9 by default.
+          forceSWCodecList.add("VP9");
+        }
+
+        ConstraintsMap androidAudioConfiguration = null;
+        if (constraintsMap.hasKey("androidAudioConfiguration")
+                && constraintsMap.getType("androidAudioConfiguration") == ObjectType.Map) {
+            androidAudioConfiguration = constraintsMap.getMap("androidAudioConfiguration");
+        }
+
+        initialize(networkIgnoreMask, forceSWCodec, forceSWCodecList, androidAudioConfiguration);
+        result.success(null);
+        break;
+      }
       case "createPeerConnection": {
         Map<String, Object> constraints = call.argument("constraints");
         Map<String, Object> configuration = call.argument("configuration");
@@ -460,6 +566,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         getUserMediaImpl.setTorch(trackId, torch, result);
         break;
       }
+      case "mediaStreamTrackSetZoom": {
+        String trackId = call.argument("trackId");
+        double zoomLevel = call.argument("zoomLevel");
+        getUserMediaImpl.setZoom(trackId, zoomLevel, result);
+        break;
+      }
       case "mediaStreamTrackSwitchCamera": {
         String trackId = call.argument("trackId");
         getUserMediaImpl.switchCamera(trackId, result);
@@ -479,6 +591,10 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         result.success(null);
         break;
       }
+      case "clearAndroidCommunicationDevice": {
+        AudioSwitchManager.instance.clearCommunicationDevice();
+        break;
+      }
       case "setMicrophoneMute":
         boolean mute = call.argument("mute");
         AudioSwitchManager.instance.setMicrophoneMute(mute);
@@ -493,6 +609,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
           result.notImplemented();
         }
         break;
+      case "setAndroidAudioConfiguration": {
+        Map<String, Object> configuration = call.argument("configuration");
+        AudioSwitchManager.instance.setAudioConfiguration(configuration);
+        result.success(null);
+        break;
+      }
       case "enableSpeakerphone":
         boolean enable = call.argument("enable");
         AudioSwitchManager.instance.enableSpeakerphone(enable);
@@ -729,12 +851,61 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         result.success(capabilitiestoMap(capabilities).toMap());
         break;
       }
-      case "setCodecPreferences":
+      case "setCodecPreferences": {
         String peerConnectionId = call.argument("peerConnectionId");
         List<Map<String, Object>> codecs = call.argument("codecs");
         String transceiverId = call.argument("transceiverId");
         rtpTransceiverSetCodecPreferences(peerConnectionId, transceiverId, codecs, result);
         break;
+      }
+      case "getSignalingState": {
+        String peerConnectionId = call.argument("peerConnectionId");
+        PeerConnection pc = getPeerConnection(peerConnectionId);
+        if (pc == null) {
+          resultError("getSignalingState", "peerConnection is null", result);
+        } else {
+          ConstraintsMap params = new ConstraintsMap();
+          params.putString("state", Utils.signalingStateString(pc.signalingState()));
+          result.success(params.toMap());
+        }
+        break;
+      }
+      case "getIceGatheringState": {
+        String peerConnectionId = call.argument("peerConnectionId");
+        PeerConnection pc = getPeerConnection(peerConnectionId);
+        if (pc == null) {
+          resultError("getIceGatheringState", "peerConnection is null", result);
+        } else {
+          ConstraintsMap params = new ConstraintsMap();
+          params.putString("state", Utils.iceGatheringStateString(pc.iceGatheringState()));
+          result.success(params.toMap());
+        }
+        break;
+      }
+      case "getIceConnectionState": {
+       String peerConnectionId = call.argument("peerConnectionId");
+       PeerConnection pc = getPeerConnection(peerConnectionId);
+        if (pc == null) {
+          resultError("getIceConnectionState", "peerConnection is null", result);
+        } else {
+          ConstraintsMap params = new ConstraintsMap();
+          params.putString("state", Utils.iceConnectionStateString(pc.iceConnectionState()));
+          result.success(params.toMap());
+        }
+        break;
+      }
+      case "getConnectionState": {
+        String peerConnectionId = call.argument("peerConnectionId");
+        PeerConnection pc = getPeerConnection(peerConnectionId);
+        if (pc == null) {
+          resultError("getConnectionState", "peerConnection is null", result);
+        } else {
+          ConstraintsMap params = new ConstraintsMap();
+          params.putString("state", Utils.connectionStateString(pc.connectionState()));
+          result.success(params.toMap());
+        }
+        break;
+      }
       default:
         if(frameCryptor.handleMethodCall(call, result)) {
           break;
